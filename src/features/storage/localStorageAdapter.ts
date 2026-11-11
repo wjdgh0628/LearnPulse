@@ -6,12 +6,13 @@ import type {
   RoadmapItem,
   StorageAdapter,
 } from '@/types';
+import { GUEST_USER_ID, getActiveUserId } from '@/stores/useAuthStore';
 
 const STORAGE_KEY = 'learnpulse_roadmaps_v2';
+const BACKUP_STORAGE_KEY = 'learnpulse_roadmaps_backup_v2';
 const SEED_FLAG_KEY = 'learnpulse_seeded_v2';
-const GUEST_USER_ID = 'guest-local-user';
 
-function generateId(prefix: string): string {
+export function generateEntityId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${prefix}_${crypto.randomUUID()}`;
   }
@@ -317,48 +318,165 @@ function createSamplePythonRoadmap(): Roadmap {
   };
 }
 
+// In-memory cache to avoid redundant JSON.parse / JSON.stringify on every read/write
+let memoryCache: Roadmap[] | null = null;
+let lastRawJson: string | null = null;
+
+function isValidRoadmap(item: unknown): item is Roadmap {
+  if (!item || typeof item !== 'object') return false;
+  const candidate = item as Record<string, unknown>;
+  return (
+    typeof candidate.id === 'string' &&
+    candidate.id.length > 0 &&
+    typeof candidate.title === 'string' &&
+    typeof candidate.topic === 'string' &&
+    Array.isArray(candidate.chapters)
+  );
+}
+
+function sanitizeRoadmaps(rawList: unknown): Roadmap[] {
+  if (!Array.isArray(rawList)) return [];
+  return rawList.filter(isValidRoadmap).map((roadmap) => ({
+    ...roadmap,
+    userId: roadmap.userId || GUEST_USER_ID,
+    isArchived: Boolean(roadmap.isArchived),
+    createdAt: roadmap.createdAt || new Date().toISOString(),
+    updatedAt: roadmap.updatedAt || roadmap.createdAt || new Date().toISOString(),
+    chapters: roadmap.chapters.map((ch, cIdx) => ({
+      ...ch,
+      roadmapId: roadmap.id,
+      orderIndex: typeof ch.orderIndex === 'number' ? ch.orderIndex : cIdx + 1,
+      items: Array.isArray(ch.items)
+        ? ch.items.map((it, iIdx) => ({
+            ...it,
+            chapterId: ch.id,
+            roadmapId: roadmap.id,
+            orderIndex:
+              typeof it.orderIndex === 'number' ? it.orderIndex : iIdx + 1,
+            status:
+              it.status === 'DONE' ||
+              it.status === 'IN_PROGRESS' ||
+              it.status === 'TODO'
+                ? it.status
+                : 'TODO',
+          }))
+        : [],
+    })),
+  }));
+}
+
 function readRoadmapsFromStorage(): Roadmap[] {
   if (typeof window === 'undefined') {
-    return [createSamplePythonRoadmap()];
+    return memoryCache ?? [createSamplePythonRoadmap()];
   }
 
   try {
     const isSeeded = window.localStorage.getItem(SEED_FLAG_KEY);
     const rawData = window.localStorage.getItem(STORAGE_KEY);
 
+    // Hit in-memory cache if raw storage string has not changed
+    if (memoryCache !== null && rawData !== null && rawData === lastRawJson) {
+      return memoryCache;
+    }
+
     if (!isSeeded && !rawData) {
       const sample = [createSamplePythonRoadmap()];
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sample));
+      const serialized = JSON.stringify(sample);
+      window.localStorage.setItem(STORAGE_KEY, serialized);
       window.localStorage.setItem(SEED_FLAG_KEY, 'true');
+      memoryCache = sample;
+      lastRawJson = serialized;
       return sample;
     }
 
     if (!rawData) {
+      memoryCache = [];
+      lastRawJson = '';
       return [];
     }
 
     const parsed: unknown = JSON.parse(rawData);
-    if (!Array.isArray(parsed)) {
-      return [];
+    const validated = sanitizeRoadmaps(parsed);
+    memoryCache = validated;
+    lastRawJson = rawData;
+    return validated;
+  } catch (err) {
+    console.warn(
+      '[LearnPulse Storage] Primary LocalStorage parse failed, checking backup:',
+      err
+    );
+    try {
+      const backupRaw = window.localStorage.getItem(BACKUP_STORAGE_KEY);
+      if (backupRaw) {
+        const recovered = sanitizeRoadmaps(JSON.parse(backupRaw));
+        if (recovered.length > 0) {
+          memoryCache = recovered;
+          lastRawJson = backupRaw;
+          return recovered;
+        }
+      }
+    } catch {
+      // Backup also unavailable
     }
 
-    return parsed as Roadmap[];
-  } catch {
-    return [createSamplePythonRoadmap()];
+    if (memoryCache && memoryCache.length > 0) {
+      return memoryCache;
+    }
+    const fallback = [createSamplePythonRoadmap()];
+    memoryCache = fallback;
+    return fallback;
   }
 }
 
-function writeRoadmapsToStorage(roadmaps: Roadmap[]): void {
-  if (typeof window === 'undefined') return;
+function writeRoadmapsToStorage(roadmaps: Roadmap[]): boolean {
+  memoryCache = roadmaps;
+  if (typeof window === 'undefined') return false;
+
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(roadmaps));
+    const serialized = JSON.stringify(roadmaps);
+    if (serialized === lastRawJson) {
+      return true;
+    }
+
+    // Keep previous valid snapshot as backup before writing new payload
+    if (lastRawJson && lastRawJson.length > 2) {
+      try {
+        window.localStorage.setItem(BACKUP_STORAGE_KEY, lastRawJson);
+      } catch {
+        // If quota is tight, remove backup to free space for primary data
+        window.localStorage.removeItem(BACKUP_STORAGE_KEY);
+      }
+    }
+
+    window.localStorage.setItem(STORAGE_KEY, serialized);
     window.localStorage.setItem(SEED_FLAG_KEY, 'true');
-  } catch {
-    // Ignore storage quota or private mode errors gracefully
+    lastRawJson = serialized;
+    return true;
+  } catch (err) {
+    // Handle QuotaExceededError by removing backup key and retrying once
+    console.warn(
+      '[LearnPulse Storage] LocalStorage write failed (possible QuotaExceededError):',
+      err
+    );
+    try {
+      window.localStorage.removeItem(BACKUP_STORAGE_KEY);
+      const serialized = JSON.stringify(roadmaps);
+      window.localStorage.setItem(STORAGE_KEY, serialized);
+      lastRawJson = serialized;
+      return true;
+    } catch (retryErr) {
+      console.error(
+        '[LearnPulse Storage] Retry failed; keeping state in memory cache:',
+        retryErr
+      );
+      return false;
+    }
   }
 }
 
-function isFullRoadmap(payload: CreateRoadmapPayload | Roadmap): payload is Roadmap {
+function isFullRoadmap(
+  payload: CreateRoadmapPayload | Roadmap
+): payload is Roadmap {
   return 'id' in payload && 'createdAt' in payload;
 }
 
@@ -366,10 +484,23 @@ export class LocalStorageAdapter implements StorageAdapter {
   public readonly mode = 'LOCAL' as const;
 
   public async getRoadmaps(): Promise<Roadmap[]> {
+    const activeUserId = getActiveUserId();
     const roadmaps = readRoadmapsFromStorage();
-    return roadmaps.sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+
+    // 게스트 데이터와 현재 로그인 사용자의 데이터를 함께 노출하되, 다른 계정의 데이터는 분리
+    const visible = roadmaps.filter(
+      (r) =>
+        !r.userId ||
+        r.userId === GUEST_USER_ID ||
+        r.userId === activeUserId
     );
+
+    return visible
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
   }
 
   public async getRoadmapById(id: string): Promise<Roadmap | null> {
@@ -377,15 +508,22 @@ export class LocalStorageAdapter implements StorageAdapter {
     return roadmaps.find((roadmap) => roadmap.id === id) ?? null;
   }
 
-  public async saveRoadmap(payload: CreateRoadmapPayload | Roadmap): Promise<Roadmap> {
-    const roadmaps = readRoadmapsFromStorage();
+  public async saveRoadmap(
+    payload: CreateRoadmapPayload | Roadmap
+  ): Promise<Roadmap> {
+    const roadmaps = readRoadmapsFromStorage().slice();
     const now = new Date().toISOString();
+    const activeUserId = getActiveUserId();
 
     if (isFullRoadmap(payload)) {
       const existingIndex = roadmaps.findIndex((r) => r.id === payload.id);
       const updatedRoadmap: Roadmap = {
         ...payload,
-        updatedAt: now,
+        userId:
+          payload.userId && payload.userId !== GUEST_USER_ID
+            ? payload.userId
+            : activeUserId,
+        updatedAt: payload.updatedAt ?? now,
       };
       if (existingIndex >= 0) {
         roadmaps[existingIndex] = updatedRoadmap;
@@ -396,11 +534,11 @@ export class LocalStorageAdapter implements StorageAdapter {
       return updatedRoadmap;
     }
 
-    const roadmapId = generateId('roadmap');
+    const roadmapId = generateEntityId('roadmap');
     const chapters: RoadmapChapter[] = payload.chapters.map((chapter, cIdx) => {
-      const chapterId = generateId('chapter');
+      const chapterId = generateEntityId('chapter');
       const items: RoadmapItem[] = chapter.items.map((item, iIdx) => ({
-        id: generateId('item'),
+        id: generateEntityId('item'),
         chapterId,
         roadmapId,
         orderIndex: iIdx + 1,
@@ -427,7 +565,7 @@ export class LocalStorageAdapter implements StorageAdapter {
 
     const newRoadmap: Roadmap = {
       id: roadmapId,
-      userId: GUEST_USER_ID,
+      userId: activeUserId,
       title: payload.title,
       topic: payload.topic,
       level: payload.level,
@@ -451,23 +589,44 @@ export class LocalStorageAdapter implements StorageAdapter {
     const roadmaps = readRoadmapsFromStorage();
     const now = new Date().toISOString();
     let updatedItem: RoadmapItem | null = null;
+    let nextRoadmaps: Roadmap[] | null = null;
 
-    for (const roadmap of roadmaps) {
-      for (const chapter of roadmap.chapters) {
-        const item = chapter.items.find((i) => i.id === itemId);
-        if (item) {
-          item.status = status;
-          item.completedAt = status === 'DONE' ? now : null;
-          roadmap.updatedAt = now;
-          updatedItem = { ...item };
+    for (let rIdx = 0; rIdx < roadmaps.length; rIdx += 1) {
+      const roadmap = roadmaps[rIdx];
+      for (let cIdx = 0; cIdx < roadmap.chapters.length; cIdx += 1) {
+        const chapter = roadmap.chapters[cIdx];
+        const iIdx = chapter.items.findIndex((i) => i.id === itemId);
+        if (iIdx !== -1) {
+          const targetItem = chapter.items[iIdx];
+          updatedItem = {
+            ...targetItem,
+            status,
+            completedAt: status === 'DONE' ? now : null,
+          };
+
+          const updatedItems = chapter.items.slice();
+          updatedItems[iIdx] = updatedItem;
+
+          const updatedChapters = roadmap.chapters.slice();
+          updatedChapters[cIdx] = {
+            ...chapter,
+            items: updatedItems,
+          };
+
+          nextRoadmaps = roadmaps.slice();
+          nextRoadmaps[rIdx] = {
+            ...roadmap,
+            updatedAt: now,
+            chapters: updatedChapters,
+          };
           break;
         }
       }
       if (updatedItem) break;
     }
 
-    if (updatedItem) {
-      writeRoadmapsToStorage(roadmaps);
+    if (updatedItem && nextRoadmaps) {
+      writeRoadmapsToStorage(nextRoadmaps);
     }
 
     return updatedItem;
@@ -481,25 +640,44 @@ export class LocalStorageAdapter implements StorageAdapter {
     const roadmaps = readRoadmapsFromStorage();
     const now = new Date().toISOString();
     let updatedItem: RoadmapItem | null = null;
+    let nextRoadmaps: Roadmap[] | null = null;
 
-    for (const roadmap of roadmaps) {
-      for (const chapter of roadmap.chapters) {
-        const item = chapter.items.find((i) => i.id === itemId);
-        if (item) {
-          item.memo = memo;
-          if (referenceLink !== undefined) {
-            item.referenceLink = referenceLink;
-          }
-          roadmap.updatedAt = now;
-          updatedItem = { ...item };
+    for (let rIdx = 0; rIdx < roadmaps.length; rIdx += 1) {
+      const roadmap = roadmaps[rIdx];
+      for (let cIdx = 0; cIdx < roadmap.chapters.length; cIdx += 1) {
+        const chapter = roadmap.chapters[cIdx];
+        const iIdx = chapter.items.findIndex((i) => i.id === itemId);
+        if (iIdx !== -1) {
+          const targetItem = chapter.items[iIdx];
+          updatedItem = {
+            ...targetItem,
+            memo,
+            ...(referenceLink !== undefined ? { referenceLink } : {}),
+          };
+
+          const updatedItems = chapter.items.slice();
+          updatedItems[iIdx] = updatedItem;
+
+          const updatedChapters = roadmap.chapters.slice();
+          updatedChapters[cIdx] = {
+            ...chapter,
+            items: updatedItems,
+          };
+
+          nextRoadmaps = roadmaps.slice();
+          nextRoadmaps[rIdx] = {
+            ...roadmap,
+            updatedAt: now,
+            chapters: updatedChapters,
+          };
           break;
         }
       }
       if (updatedItem) break;
     }
 
-    if (updatedItem) {
-      writeRoadmapsToStorage(roadmaps);
+    if (updatedItem && nextRoadmaps) {
+      writeRoadmapsToStorage(nextRoadmaps);
     }
 
     return updatedItem;
@@ -510,13 +688,19 @@ export class LocalStorageAdapter implements StorageAdapter {
     isArchived: boolean
   ): Promise<Roadmap | null> {
     const roadmaps = readRoadmapsFromStorage();
-    const target = roadmaps.find((r) => r.id === id);
-    if (!target) return null;
+    const rIdx = roadmaps.findIndex((r) => r.id === id);
+    if (rIdx === -1) return null;
 
-    target.isArchived = isArchived;
-    target.updatedAt = new Date().toISOString();
-    writeRoadmapsToStorage(roadmaps);
-    return { ...target };
+    const updatedRoadmap: Roadmap = {
+      ...roadmaps[rIdx],
+      isArchived,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextRoadmaps = roadmaps.slice();
+    nextRoadmaps[rIdx] = updatedRoadmap;
+
+    writeRoadmapsToStorage(nextRoadmaps);
+    return updatedRoadmap;
   }
 
   public async deleteRoadmap(id: string): Promise<boolean> {
@@ -527,6 +711,102 @@ export class LocalStorageAdapter implements StorageAdapter {
     }
     writeRoadmapsToStorage(nextRoadmaps);
     return true;
+  }
+
+  /**
+   * 로컬 데이터와 원격(Supabase) 데이터를 updatedAt 타임스탬프 기준(Last-Write-Wins)으로
+   * 손실이나 중복 없이 병합하고, 오프라인에서 생성/수정된 로컬 항목도 보존합니다.
+   */
+  public mergeWithRemoteRoadmaps(
+    remoteRoadmaps: Roadmap[]
+  ): { merged: Roadmap[]; localOnlyOrNewer: Roadmap[] } {
+    const localRoadmaps = readRoadmapsFromStorage();
+    const byId = new Map<string, Roadmap>();
+    const localOnlyOrNewer: Roadmap[] = [];
+
+    for (const remote of remoteRoadmaps) {
+      byId.set(remote.id, remote);
+    }
+
+    for (const local of localRoadmaps) {
+      const existingRemote = byId.get(local.id);
+      if (!existingRemote) {
+        byId.set(local.id, local);
+        localOnlyOrNewer.push(local);
+        continue;
+      }
+
+      const localTime = new Date(local.updatedAt ?? local.createdAt).getTime();
+      const remoteTime = new Date(
+        existingRemote.updatedAt ?? existingRemote.createdAt
+      ).getTime();
+
+      if (localTime > remoteTime) {
+        // 로컬(오프라인)에서 더 최근에 상태/메모를 변경한 경우 로컬 버전 유지 및 서버 동기화 대상에 추가
+        // 단, 원격에만 없고 로컬에만 있는 subTasks/keywords 세부 메타데이터도 보존
+        byId.set(local.id, local);
+        localOnlyOrNewer.push(local);
+      } else {
+        // 원격 버전이 같거나 더 최신인 경우 원격 상태 반영 + 로컬의 세부 가이드 필드(subTasks/keywords) 보강
+        const enrichedChapters = existingRemote.chapters.map((rCh) => {
+          const lCh = local.chapters.find((c) => c.id === rCh.id);
+          return {
+            ...rCh,
+            items: rCh.items.map((rItem) => {
+              const lItem = lCh?.items.find((i) => i.id === rItem.id);
+              return {
+                ...lItem,
+                ...rItem,
+                description: rItem.description || lItem?.description,
+                subTasks:
+                  rItem.subTasks && rItem.subTasks.length > 0
+                    ? rItem.subTasks
+                    : lItem?.subTasks,
+                keywords:
+                  rItem.keywords && rItem.keywords.length > 0
+                    ? rItem.keywords
+                    : lItem?.keywords,
+                estimatedTime: rItem.estimatedTime || lItem?.estimatedTime,
+              };
+            }),
+          };
+        });
+        byId.set(local.id, {
+          ...existingRemote,
+          chapters: enrichedChapters,
+        });
+      }
+    }
+
+    const merged = Array.from(byId.values()).sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    writeRoadmapsToStorage(merged);
+    return { merged, localOnlyOrNewer };
+  }
+
+  /**
+   * 최초 로그인 시 게스트 상태(guest-local-user)에서 작성했던 로드맵들을
+   * 현재 로그인한 사용자 ID 소유로 안전하게 귀속시킵니다.
+   */
+  public claimGuestRoadmaps(userId: string): Roadmap[] {
+    if (!userId || userId === GUEST_USER_ID) {
+      return readRoadmapsFromStorage();
+    }
+    const roadmaps = readRoadmapsFromStorage();
+    let changed = false;
+    const next = roadmaps.map((r) => {
+      if (!r.userId || r.userId === GUEST_USER_ID) {
+        changed = true;
+        return { ...r, userId };
+      }
+      return r;
+    });
+    if (changed) {
+      writeRoadmapsToStorage(next);
+    }
+    return next;
   }
 }
 

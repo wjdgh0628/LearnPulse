@@ -37,7 +37,7 @@ const STATUS_OPTIONS: Array<{
   { value: 'DONE', label: '완료' },
 ];
 
-export const ItemRow: React.FC<ItemRowProps> = ({
+const ItemRowComponent: React.FC<ItemRowProps> = ({
   item,
   isMemoOpen = false,
   onStatusChange,
@@ -318,3 +318,5 @@ export const ItemRow: React.FC<ItemRowProps> = ({
     </li>
   );
 };
+
+export const ItemRow = React.memo(ItemRowComponent);

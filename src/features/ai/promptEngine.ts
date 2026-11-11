@@ -3,7 +3,7 @@ import {
   type AIRoadmapGenerationInput,
   type AIRoadmapResult,
   type UserLevel,
-} from "@/types";
+} from '@/types';
 
 export const SYSTEM_PROMPT = `당신은 최고의 커리큘럼 설계자이자 친절한 학습 코치입니다.
 사용자가 입력한 [학습 주제], [현재 수준(BEGINNER/INTERMEDIATE/ADVANCED)], [목표 기간]을 분석하여, 막막함 없이 당장 오늘부터 하나씩 따라 할 수 있도록 아주 세분화된 단계별 학습 로드맵을 구축하십시오.
@@ -12,11 +12,11 @@ export const SYSTEM_PROMPT = `당신은 최고의 커리큘럼 설계자이자 �
 
 const LEVEL_DESCRIPTIONS: Record<UserLevel, string> = {
   BEGINNER:
-    "입문 (해당 분야를 처음 접하며 기초 용어와 핵심 개념부터 차근차근 필요한 단계)",
+    '입문 (해당 분야를 처음 접하며 기초 용어와 핵심 개념부터 차근차근 필요한 단계)',
   INTERMEDIATE:
-    "중급 (기본 문법과 개념은 알고 있으나 실전 적용 및 응용 학습이 필요한 단계)",
+    '중급 (기본 문법과 개념은 알고 있으나 실전 적용 및 응용 학습이 필요한 단계)',
   ADVANCED:
-    "심화 (실무 아키텍처 설계, 성능 최적화, 고난도 문제 해결이 목표인 단계)",
+    '심화 (실무 아키텍처 설계, 성능 최적화, 고난도 문제 해결이 목표인 단계)',
 };
 
 export function buildRoadmapPrompt(input: AIRoadmapGenerationInput): string {
@@ -59,7 +59,7 @@ export function buildRoadmapPrompt(input: AIRoadmapGenerationInput): string {
 
 조건:
 1. chapters는 4개에서 6개 사이로 구성하십시오.
-2. 각 chapter의 items는 6개에서 8개 사이로 잘게 쪼개어 구성하십시오.
+2. 각 chapter의 items는 3개에서 6개 사이로 잘게 쪼개어 구성하십시오.
 3. 각 item의 subTasks는 반드시 3개 이상의 구체적인 행동 순서(Step 1 -> Step 2 -> Step 3)로 작성하십시오.
 4. 오직 순수 JSON 객체 문자열만 출력하십시오.`;
 }
@@ -72,8 +72,8 @@ export function extractJsonString(rawText: string): string {
     return codeBlockMatch[1].trim();
   }
 
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     return trimmed.slice(firstBrace, lastBrace + 1);
   }
@@ -83,6 +83,23 @@ export function extractJsonString(rawText: string): string {
 
 export function parseAndValidateAIRoadmap(rawText: string): AIRoadmapResult {
   const cleanJson = extractJsonString(rawText);
-  const parsed: unknown = JSON.parse(cleanJson);
-  return AIRoadmapSchema.parse(parsed);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleanJson);
+  } catch (err) {
+    throw new Error(
+      `[AI Roadmap Parser] Invalid JSON format returned by AI: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
+  const validation = AIRoadmapSchema.safeParse(parsed);
+  if (!validation.success) {
+    throw new Error(
+      `[AI Roadmap Schema] Validation failed: ${validation.error.message}`
+    );
+  }
+
+  return validation.data;
 }

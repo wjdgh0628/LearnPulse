@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
@@ -86,7 +86,20 @@ export const StudyGuideView: React.FC<StudyGuideViewProps> = ({
   onStatusChange,
   onSaveMemo,
 }) => {
-  const guide = generateStudyGuideContent(item, roadmapTopic, chapterTitle);
+  const guide = useMemo(
+    () => generateStudyGuideContent(item, roadmapTopic, chapterTitle),
+    [
+      item.id,
+      item.title,
+      item.description,
+      item.estimatedTime,
+      item.referenceLink,
+      item.keywords,
+      item.subTasks,
+      roadmapTopic,
+      chapterTitle,
+    ]
+  );
 
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [openAnswers, setOpenAnswers] = useState<Record<number, boolean>>({});

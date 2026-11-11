@@ -1,31 +1,61 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { Badge } from '@/components/common';
 import { Header, Navigation, Container, Footer } from '@/components/layout';
-import { LoginModal, GuestBanner } from '@/components/auth';
-import { TopicForm, ManualRoadmapModal } from '@/components/roadmap-creator';
+import { GuestBanner } from '@/components/auth/GuestBanner';
 import { StatsOverview, RoadmapLibraryGrid } from '@/components/dashboard';
-import {
-  RoadmapHeader,
-  ChapterAccordion,
-  ItemMemoDrawer,
-  StudyGuideView,
-} from '@/components/roadmap-view';
-import { useRoadmapStore } from '@/stores/useRoadmapStore';
-import { useRoadmapsQuery, useRoadmapMutations } from '@/hooks/useRoadmap';
+import { RoadmapHeader } from '@/components/roadmap-view/RoadmapHeader';
+import { ChapterAccordion } from '@/components/roadmap-view/ChapterAccordion';
+import { useRoadmapNavigation } from '@/hooks/useRoadmapNavigation';
 import { useAuth } from '@/hooks/useAuth';
-import type {
-  CreateRoadmapPayload,
-  ItemStatus,
-  RoadmapItem,
-} from '@/types';
+
+// 초기 대시보드 렌더링에 불필요한 무거운 뷰/모달을 지연 로딩(Code Splitting)으로 분리
+const StudyGuideView = lazy(() =>
+  import('@/components/roadmap-view/StudyGuideView').then((mod) => ({
+    default: mod.StudyGuideView,
+  }))
+);
+const TopicForm = lazy(() =>
+  import('@/components/roadmap-creator/TopicForm').then((mod) => ({
+    default: mod.TopicForm,
+  }))
+);
+const ManualRoadmapModal = lazy(() =>
+  import('@/components/roadmap-creator/ManualRoadmapModal').then((mod) => ({
+    default: mod.ManualRoadmapModal,
+  }))
+);
+const ItemMemoDrawer = lazy(() =>
+  import('@/components/roadmap-view/ItemMemoDrawer').then((mod) => ({
+    default: mod.ItemMemoDrawer,
+  }))
+);
+const LoginModal = lazy(() =>
+  import('@/components/auth/LoginModal').then((mod) => ({
+    default: mod.LoginModal,
+  }))
+);
+
+const ViewLoadingFallback: React.FC = () => (
+  <div
+    className="flex min-h-[240px] items-center justify-center rounded-2xl border border-slate-200/80 bg-white p-8 text-sm font-medium text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400"
+    role="status"
+    aria-live="polite"
+  >
+    화면을 불러오는 중입니다...
+  </div>
+);
 
 export const App: React.FC = () => {
   const {
+    roadmaps,
     activeTab,
     selectedRoadmapId,
+    selectedRoadmap,
     activeMemoItemId,
-    activeStudyGuideItemId,
+    activeMemoItem,
+    activeMemoChapterTitle,
     activeStudyGuideKeyword,
+    activeStudyGuideData,
     libraryFilter,
     isManualModalOpen,
     manualModalPrefill,
@@ -41,21 +71,18 @@ export const App: React.FC = () => {
     closeManualModal,
     triggerQuickTopicCreator,
     clearPendingQuickTopic,
-  } = useRoadmapStore();
+    handleSaveRoadmap,
+    handleToggleArchive,
+    handleDeleteRoadmap,
+    handleStatusChange,
+    handleSaveMemo,
+    handleOpenStudyGuideFromDashboard,
+  } = useRoadmapNavigation();
 
   const { user, isGuest, storageMode, login, logout } = useAuth();
 
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
   const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
-
-  const { data: roadmaps = [] } = useRoadmapsQuery();
-  const {
-    saveRoadmapMutation,
-    toggleArchiveMutation,
-    deleteRoadmapMutation,
-    updateItemStatusMutation,
-    saveItemMemoMutation,
-  } = useRoadmapMutations();
 
   useEffect(() => {
     const root = document.documentElement;
@@ -65,98 +92,6 @@ export const App: React.FC = () => {
       root.classList.remove('dark');
     }
   }, [isDarkMode]);
-
-  const selectedRoadmap =
-    roadmaps.find((r) => r.id === selectedRoadmapId) ?? null;
-
-  let activeMemoItem: RoadmapItem | null = null;
-  let activeMemoChapterTitle: string | undefined;
-
-  if (selectedRoadmap && activeMemoItemId) {
-    for (const chapter of selectedRoadmap.chapters) {
-      const found = chapter.items.find((i) => i.id === activeMemoItemId);
-      if (found) {
-        activeMemoItem = found;
-        activeMemoChapterTitle = chapter.title;
-        break;
-      }
-    }
-  }
-
-  // Locate active Study Guide item + Prev/Next items across chapters
-  let activeStudyGuideData: {
-    item: RoadmapItem;
-    chapterTitle: string;
-    prevItem: { id: string; title: string } | null;
-    nextItem: { id: string; title: string } | null;
-  } | null = null;
-
-  if (selectedRoadmap && activeStudyGuideItemId) {
-    const flatItems: Array<{ item: RoadmapItem; chapterTitle: string }> = [];
-    for (const chapter of selectedRoadmap.chapters) {
-      for (const item of chapter.items) {
-        flatItems.push({ item, chapterTitle: chapter.title });
-      }
-    }
-
-    const currentIdx = flatItems.findIndex(
-      (entry) => entry.item.id === activeStudyGuideItemId
-    );
-    if (currentIdx !== -1) {
-      const currentEntry = flatItems[currentIdx];
-      const prevEntry = currentIdx > 0 ? flatItems[currentIdx - 1] : null;
-      const nextEntry =
-        currentIdx < flatItems.length - 1 ? flatItems[currentIdx + 1] : null;
-
-      activeStudyGuideData = {
-        item: currentEntry.item,
-        chapterTitle: currentEntry.chapterTitle,
-        prevItem: prevEntry
-          ? { id: prevEntry.item.id, title: prevEntry.item.title }
-          : null,
-        nextItem: nextEntry
-          ? { id: nextEntry.item.id, title: nextEntry.item.title }
-          : null,
-      };
-    }
-  }
-
-  const handleSaveRoadmap = async (payload: CreateRoadmapPayload) => {
-    const created = await saveRoadmapMutation.mutateAsync(payload);
-    setActiveTab('LIBRARY');
-    selectRoadmap(created.id);
-  };
-
-  const handleToggleArchive = (roadmapId: string, nextArchived: boolean) => {
-    toggleArchiveMutation.mutate({ id: roadmapId, isArchived: nextArchived });
-  };
-
-  const handleDeleteRoadmap = (roadmapId: string) => {
-    if (selectedRoadmapId === roadmapId) {
-      selectRoadmap(null);
-    }
-    deleteRoadmapMutation.mutate(roadmapId);
-  };
-
-  const handleStatusChange = (itemId: string, nextStatus: ItemStatus) => {
-    updateItemStatusMutation.mutate({ itemId, status: nextStatus });
-  };
-
-  const handleSaveMemo = (
-    itemId: string,
-    memo: string,
-    referenceLink?: string
-  ) => {
-    saveItemMemoMutation.mutate({ itemId, memo, referenceLink });
-  };
-
-  const handleOpenStudyGuideFromDashboard = (
-    roadmapId: string,
-    itemId: string
-  ) => {
-    selectRoadmap(roadmapId);
-    openStudyGuide(itemId);
-  };
 
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 transition-colors dark:bg-slate-950 dark:text-slate-100">
@@ -186,19 +121,21 @@ export const App: React.FC = () => {
           {activeTab === 'LIBRARY' ? (
             selectedRoadmap ? (
               activeStudyGuideData ? (
-                <StudyGuideView
-                  roadmapTitle={selectedRoadmap.title}
-                  roadmapTopic={selectedRoadmap.topic}
-                  chapterTitle={activeStudyGuideData.chapterTitle}
-                  item={activeStudyGuideData.item}
-                  highlightedKeyword={activeStudyGuideKeyword}
-                  prevItem={activeStudyGuideData.prevItem}
-                  nextItem={activeStudyGuideData.nextItem}
-                  onBack={closeStudyGuide}
-                  onSelectItem={(nextId) => openStudyGuide(nextId)}
-                  onStatusChange={handleStatusChange}
-                  onSaveMemo={handleSaveMemo}
-                />
+                <Suspense fallback={<ViewLoadingFallback />}>
+                  <StudyGuideView
+                    roadmapTitle={selectedRoadmap.title}
+                    roadmapTopic={selectedRoadmap.topic}
+                    chapterTitle={activeStudyGuideData.chapterTitle}
+                    item={activeStudyGuideData.item}
+                    highlightedKeyword={activeStudyGuideKeyword}
+                    prevItem={activeStudyGuideData.prevItem}
+                    nextItem={activeStudyGuideData.nextItem}
+                    onBack={closeStudyGuide}
+                    onSelectItem={(nextId) => openStudyGuide(nextId)}
+                    onStatusChange={handleStatusChange}
+                    onSaveMemo={handleSaveMemo}
+                  />
+                </Suspense>
               ) : (
                 <section
                   className="space-y-6"
@@ -221,10 +158,8 @@ export const App: React.FC = () => {
                         defaultOpen
                         activeMemoItemId={activeMemoItemId}
                         onStatusChange={handleStatusChange}
-                        onOpenMemo={(itemId) => openMemoDrawer(itemId)}
-                        onOpenStudyGuide={(itemId, kw) =>
-                          openStudyGuide(itemId, kw)
-                        }
+                        onOpenMemo={openMemoDrawer}
+                        onOpenStudyGuide={openStudyGuide}
                       />
                     ))}
                   </div>
@@ -267,7 +202,7 @@ export const App: React.FC = () => {
                   selectedRoadmapId={selectedRoadmapId}
                   filter={libraryFilter}
                   onChangeFilter={setLibraryFilter}
-                  onSelectRoadmap={(id) => selectRoadmap(id)}
+                  onSelectRoadmap={selectRoadmap}
                   onToggleArchive={handleToggleArchive}
                   onDeleteRoadmap={handleDeleteRoadmap}
                   onOpenCreator={() => setActiveTab('CREATOR')}
@@ -288,11 +223,13 @@ export const App: React.FC = () => {
                 </p>
               </div>
 
-              <TopicForm
-                onSaveRoadmap={handleSaveRoadmap}
-                pendingQuickTopic={pendingQuickTopic}
-                onClearQuickTopic={clearPendingQuickTopic}
-              />
+              <Suspense fallback={<ViewLoadingFallback />}>
+                <TopicForm
+                  onSaveRoadmap={handleSaveRoadmap}
+                  pendingQuickTopic={pendingQuickTopic}
+                  onClearQuickTopic={clearPendingQuickTopic}
+                />
+              </Suspense>
             </section>
           )}
         </Container>
@@ -300,31 +237,43 @@ export const App: React.FC = () => {
 
       <Footer />
 
-      {/* 1-Depth 수동 로드맵 즉시 생성 팝업 (우측 상단 Split Button ➕ 아이콘 연동) */}
-      <ManualRoadmapModal
-        isOpen={isManualModalOpen}
-        prefill={manualModalPrefill}
-        onClose={closeManualModal}
-        onSaveRoadmap={handleSaveRoadmap}
-      />
+      {/* 1-Depth 수동 로드맵 즉시 생성 팝업 (열릴 때만 지연 렌더링) */}
+      {isManualModalOpen && (
+        <Suspense fallback={null}>
+          <ManualRoadmapModal
+            isOpen={isManualModalOpen}
+            prefill={manualModalPrefill}
+            onClose={closeManualModal}
+            onSaveRoadmap={handleSaveRoadmap}
+          />
+        </Suspense>
+      )}
 
-      {/* Inline Memo & Reference Link Side Drawer */}
-      <ItemMemoDrawer
-        item={activeMemoItem}
-        chapterTitle={activeMemoChapterTitle}
-        onClose={closeMemoDrawer}
-        onSaveMemo={(id, memo, link) => handleSaveMemo(id, memo, link)}
-      />
+      {/* Inline Memo & Reference Link Side Drawer (열릴 때만 지연 렌더링) */}
+      {activeMemoItem && (
+        <Suspense fallback={null}>
+          <ItemMemoDrawer
+            item={activeMemoItem}
+            chapterTitle={activeMemoChapterTitle}
+            onClose={closeMemoDrawer}
+            onSaveMemo={handleSaveMemo}
+          />
+        </Suspense>
+      )}
 
-      {/* Hybrid Auth & Profile Sync Modal */}
-      <LoginModal
-        isOpen={isLoginModalOpen}
-        onClose={() => setIsLoginModalOpen(false)}
-        user={user}
-        storageMode={storageMode}
-        onLogin={login}
-        onLogout={logout}
-      />
+      {/* Hybrid Auth & Profile Sync Modal (열릴 때만 지연 렌더링) */}
+      {isLoginModalOpen && (
+        <Suspense fallback={null}>
+          <LoginModal
+            isOpen={isLoginModalOpen}
+            onClose={() => setIsLoginModalOpen(false)}
+            user={user}
+            storageMode={storageMode}
+            onLogin={login}
+            onLogout={logout}
+          />
+        </Suspense>
+      )}
     </div>
   );
 };
